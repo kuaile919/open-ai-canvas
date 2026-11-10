@@ -1,10 +1,12 @@
+import { translate } from "@/i18n";
 import { useCallback, useEffect, useRef, useState, type Dispatch, type SetStateAction } from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import { App } from "antd";
 
 import { NODE_DEFAULT_SIZE } from "@/constant/canvas";
 import { FOLDER_COLLAPSED_HEIGHT, FOLDER_COLLAPSED_WIDTH, FRAME_COLLAPSED_HEIGHT, FRAME_COLLAPSED_WIDTH, getFrameChildIds, isCanvasFolderNode, isFrameNode } from "@/lib/canvas/canvas-frame";
-import { buildCanvasMediaDownloadFileName, canDownloadCanvasNodeMedia, isCanvasMediaCompositePending } from "@/lib/canvas/canvas-media-download";
+import { buildCanvasMediaDownloadFileName, canDownloadCanvasNodeMedia, canvasMediaFileExtension, downloadImageConvertedToFormat, isCanvasMediaCompositePending, preferredImageDownloadFormat, withFileExtension } from "@/lib/canvas/canvas-media-download";
+import { resourceIdFromStorageKey, resourceFileUrl } from "@/services/api/resources";
 import { writeCanvasNodePrompt } from "@/lib/canvas/canvas-node-prompt";
 import { applyBatchPrimaryImage, applyNodeConfigPatch } from "@/lib/canvas/canvas-project-domain";
 import { resetGenerationTaskMetadata } from "@/lib/canvas/canvas-project-generation";
@@ -94,7 +96,8 @@ export function useCanvasNodeEditor({
     const handleNodeTitleChange = useCallback((nodeId: string, title: string) => {
         const node = nodesRef.current.find((node) => node.id === nodeId);
         if (!node || node.metadata?.locked || node.title === title || !canvasEditLeases.input(canvasId, nodeId)) return;
-        setNodes((current) => current.map((node) => (node.id === nodeId ? { ...node, title } : node)));
+        // 标记为用户命名：之后原位重新生成沿用这个名称，不再用提示词开头覆盖。标题逐字输入时 metadata 只换一次引用。
+        setNodes((current) => current.map((node) => (node.id === nodeId ? { ...node, title, metadata: node.metadata?.manualTitle ? node.metadata : { ...node.metadata, manualTitle: true } } : node)));
     }, [canvasId, nodesRef, setNodes]);
 
     const handleFolderStyleChange = useCallback((nodeId: string, style: CanvasFolderStyle) => {
@@ -208,23 +211,44 @@ export function useCanvasNodeEditor({
             .then(async (result) => {
                 setNodes((current) => current.map((item) => item.id === nodeId ? { ...item, metadata: { ...item.metadata, assetId: result.assetId } } : item));
                 if (domainProjectId) await queryClient.invalidateQueries({ queryKey: ["project", domainProjectId] });
-                message.success("资产分类已更新");
+                message.success(translate("canvasPage.nodeEditor.assetCategoryUpdated"));
             })
-            .catch((error) => message.error(error instanceof Error ? error.message : "资产分类更新失败"));
+            .catch((error) => message.error(error instanceof Error ? error.message : translate("canvasPage.nodeEditor.assetCategoryFailed")));
         return true;
     }, [canvasId, domainProjectId, message, nodesRef, queryClient, setNodes]);
 
     const downloadNodeImage = useCallback(async (node: CanvasNodeData) => {
-        if (node.metadata?.imageLayerGroup?.compositeStatus && node.metadata.imageLayerGroup.compositeStatus !== "ready") { message.warning("请等待图层合成成功后再下载"); return; }
+        if (node.metadata?.imageLayerGroup?.compositeStatus && node.metadata.imageLayerGroup.compositeStatus !== "ready") { message.warning(translate("canvasPage.nodeEditor.waitCompositeDownload")); return; }
         const supported = node.type === CanvasNodeType.Image || node.type === CanvasNodeType.Video || node.type === CanvasNodeType.Audio;
         const content = node.metadata?.content?.trim();
         const storageKey = node.metadata?.storageKey?.trim();
         if (!supported || (!content && !storageKey)) return;
         try {
             const downloadName = buildCanvasMediaDownloadFileName(canvasTitle, node);
+            // 兑现图像设置里的输出格式：模型/渠道可能忽略 output_format 仍返回 PNG。
+            const targetFormat = preferredImageDownloadFormat(node);
+            const currentExtension = canvasMediaFileExtension(node);
+            const needsConversion = Boolean(targetFormat && currentExtension !== targetFormat && currentExtension !== (targetFormat === "jpeg" ? "jpg" : targetFormat));
+            if (targetFormat && needsConversion) {
+                // jpeg：平台端转码（/file?format=jpeg 同源输出，<a download> 可命名，无跨域限制）。
+                if (targetFormat === "jpeg" && storageKey) {
+                    const resourceId = resourceIdFromStorageKey(storageKey);
+                    if (resourceId) {
+                        startBrowserDownload(`${resourceFileUrl(resourceId)}?format=jpeg`, withFileExtension(downloadName, "jpg"));
+                        return;
+                    }
+                }
+                // webp：客户端转码，能读到字节时生效；失败回退原图直下。
+                try {
+                    await downloadImageConvertedToFormat({ storageKey, url: content, fileName: downloadName, format: targetFormat });
+                    return;
+                } catch {
+                    // 落到原图下载，保证下载永远可用。
+                }
+            }
             await downloadBrowserMedia({ storageKey, url: content, fileName: downloadName });
         } catch (error) {
-            message.error(error instanceof Error ? error.message : "下载失败");
+            message.error(error instanceof Error ? error.message : translate("canvasPage.nodeEditor.downloadFailed"));
         }
     }, [canvasTitle, message]);
 
@@ -235,7 +259,7 @@ export function useCanvasNodeEditor({
         const pendingCount = media.filter(isCanvasMediaCompositePending).length;
         const targets = media.filter((node) => !isCanvasMediaCompositePending(node));
         if (!targets.length) {
-            message.warning(pendingCount ? "请等待图层合成成功后再下载" : "选中的节点里没有可下载的图片、视频或音频");
+            message.warning(pendingCount ? translate("canvasPage.nodeEditor.waitCompositeDownload") : translate("canvasPage.nodeEditor.noDownloadableMedia"));
             return;
         }
         const now = new Date();
@@ -249,7 +273,7 @@ export function useCanvasNodeEditor({
         const failures: string[] = [];
         for (const [index, result] of resolved.entries()) {
             if (result.status === "rejected") {
-                failures.push(result.reason instanceof Error ? result.reason.message : "下载失败");
+                failures.push(result.reason instanceof Error ? result.reason.message : translate("canvasPage.nodeEditor.downloadFailed"));
                 continue;
             }
             if (started > 0) await new Promise((resolve) => window.setTimeout(resolve, BATCH_DOWNLOAD_INTERVAL_MS));
@@ -257,24 +281,24 @@ export function useCanvasNodeEditor({
             started += 1;
         }
         const skipped = nodes.length - targets.length;
-        const skippedNote = skipped ? `，跳过 ${skipped} 个无媒体或未合成的节点` : "";
-        if (!started) message.error(`下载失败：${failures[0] || "没有可下载的资源"}`);
-        else if (failures.length) message.warning(`已开始下载 ${started} 个文件，${failures.length} 个失败：${failures[0]}${skippedNote}`);
-        else message.success(`已开始下载 ${started} 个文件${skippedNote}`);
+        const skippedNote = skipped ? translate("canvasPage.nodeEditor.skippedNote", { count: skipped }) : "";
+        if (!started) message.error(translate("canvasPage.nodeEditor.downloadFailedWithReason", { error: failures[0] || translate("canvasPage.nodeEditor.noDownloadableResource") }));
+        else if (failures.length) message.warning(translate("canvasPage.nodeEditor.downloadPartial", { count: started, failed: failures.length, error: failures[0], skipped: skippedNote }));
+        else message.success(translate("canvasPage.nodeEditor.downloadStarted", { count: started, skipped: skippedNote }));
     }, [canvasTitle, message]);
 
     const saveNodeAsset = useCallback(async (node: CanvasNodeData) => {
-        if (node.metadata?.imageLayerGroup?.compositeStatus && node.metadata.imageLayerGroup.compositeStatus !== "ready") { message.warning("请等待图层合成成功后再保存素材"); return; }
-        if (node.type !== CanvasNodeType.Text && node.type !== CanvasNodeType.Image && node.type !== CanvasNodeType.Video && node.type !== CanvasNodeType.Audio) return message.error("当前节点类型不能保存为素材");
-        if (!node.metadata?.content?.trim()) return message.error("当前节点没有可保存的内容");
+        if (node.metadata?.imageLayerGroup?.compositeStatus && node.metadata.imageLayerGroup.compositeStatus !== "ready") { message.warning(translate("canvasPage.nodeEditor.waitCompositeSave")); return; }
+        if (node.type !== CanvasNodeType.Text && node.type !== CanvasNodeType.Image && node.type !== CanvasNodeType.Video && node.type !== CanvasNodeType.Audio) return message.error(translate("canvasPage.nodeEditor.typeNotSavable"));
+        if (!node.metadata?.content?.trim()) return message.error(translate("canvasPage.nodeEditor.nothingToSave"));
         try {
             const result = await ensureCanvasNodeAsset({ canvasId, domainProjectId, node, source: "canvas-manual" });
             setNodes((current) => current.map((item) => item.id === node.id ? { ...item, metadata: { ...item.metadata, assetId: result.assetId } } : item));
             if (domainProjectId) await queryClient.invalidateQueries({ queryKey: ["project", domainProjectId] });
-            if (result.syncPending) message.info(domainProjectId ? "已保存到本地素材，云端项目资产正在自动同步" : "已保存到本地素材，云端素材正在自动同步");
-            else message.success(result.linkedToProject ? "已加入项目资产" : "已加入我的素材");
+            if (result.syncPending) message.info(domainProjectId ? translate("canvasPage.nodeEditor.savedLocalProjectSync") : translate("canvasPage.nodeEditor.savedLocalAssetSync"));
+            else message.success(result.linkedToProject ? translate("canvasPage.nodeEditor.addedToProject") : translate("canvasPage.nodeEditor.addedToMyAssets"));
         } catch (error) {
-            message.error(error instanceof Error ? error.message : "素材保存失败");
+            message.error(error instanceof Error ? error.message : translate("canvasPage.nodeEditor.saveAssetFailed"));
         }
     }, [canvasId, domainProjectId, message, queryClient, setNodes]);
 

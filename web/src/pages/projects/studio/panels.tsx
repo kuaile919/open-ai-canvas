@@ -4,7 +4,8 @@ import { App, Button, Checkbox, Input, InputNumber, Select, Switch } from "antd"
 import { AlertCircle, ArrowRight, Brush, CheckCheck, Clapperboard, Film, FolderOpen, Gem, Inbox, Lock, MapPinned, Maximize2, PauseCircle, RefreshCw, RotateCcw, ScrollText, Upload, UserRound, UsersRound, Cpu, PackageCheck, Play } from "lucide-react";
 
 import { CanvasImagePreview } from "@/components/canvas/canvas-image-preview";
-import { dramaChoiceKey, dramaVideoRatioIssue } from "@/lib/drama/model-choice";
+import { dramaChoiceKey, dramaResolutionAfterModelChange, dramaVideoRatioIssue, dramaVideoResolutionIssue } from "@/lib/drama/model-choice";
+import { formatVideoResolutionLabel } from "@/lib/video-generation-options";
 import { dramaKeys } from "@/lib/drama/drama-query-keys";
 import {
     getDramaCastImpact,
@@ -20,8 +21,10 @@ import {
     type DramaSettings,
     type DramaInboxItem,
     type DramaMediaMode,
+    type DramaModelChoice,
     type DramaReviewMode,
     type DramaSummary,
+    type DramaTextThinking,
     type DramaVideoContinuity,
 } from "@/services/api/drama";
 
@@ -34,7 +37,7 @@ import { progressFillStyle } from "@/lib/progress-fill";
 import { uploadResourceFile } from "@/services/api/resources";
 import { DramaTakeList } from "./take-list";
 import { CastLibraryPicker } from "./cast-library-picker";
-import { CastVoiceField } from "./cast-voice";
+import { CastVoiceField, CastVoicePreview } from "./cast-voice";
 import { CastLooks } from "./cast-looks";
 
 // 制作台的三个整页视图：设定（角色 / 道具 / 场景）、待处理、制作设置。都在主区域内展示，不使用抽屉遮挡。
@@ -163,36 +166,43 @@ export function CastPanel({
                     ) : null}
                     <div className={`drama-cast-grid ${kindRatio.orientation}`}>
                         {list.map((item) => (
-                            <button key={item.id} type="button" className="drama-cast-card" aria-current={item.id === active?.id} onClick={() => onFocus(item.id)}>
-                                <div className="drama-cast-card-media" style={kindRatio.style}>
-                                    {item.imageResourceId ? <MediaThumb resourceId={item.imageResourceId} alt={item.name} loading={castImageLoading} failed={castImageFailed} /> : null}
-                                    {!item.imageResourceId || mediaBusy(item.imageStatus) || item.imageStatus === "failed" || item.imageStatus === "" ? (
-                                        <div className={`drama-shot-placeholder ${mediaBusy(item.imageStatus) ? "is-busy" : ""}`}>
-                                            {item.imageStatus === "failed" ? (
-                                                <span className="drama-cast-card-failed">
-                                                    <AlertCircle className="size-3.5" />
-                                                    生成失败
+                            <div key={item.id} className="drama-cast-card" aria-current={item.id === active?.id}>
+                                <button type="button" className="block w-full text-left" aria-label={`编辑${item.name}`} onClick={() => onFocus(item.id)}>
+                                    <div className="drama-cast-card-media" style={kindRatio.style}>
+                                        {item.imageResourceId ? <MediaThumb resourceId={item.imageResourceId} alt={item.name} loading={castImageLoading} failed={castImageFailed} /> : null}
+                                        {!item.imageResourceId || mediaBusy(item.imageStatus) || item.imageStatus === "failed" || item.imageStatus === "" ? (
+                                            <div className={`drama-shot-placeholder ${mediaBusy(item.imageStatus) ? "is-busy" : ""}`}>
+                                                {item.imageStatus === "failed" ? (
+                                                    <span className="drama-cast-card-failed">
+                                                        <AlertCircle className="size-3.5" />
+                                                        生成失败
+                                                    </span>
+                                                ) : item.imageResourceId ? (
+                                                    "更新中…"
+                                                ) : (
+                                                    CAST_KIND_ICON[item.kind]
+                                                )}
+                                            </div>
+                                        ) : null}
+                                        {item.locked ? (
+                                            <span className="drama-shot-flags">
+                                                <span className="drama-flag is-lock">
+                                                    <Lock className="size-3" />
                                                 </span>
-                                            ) : item.imageResourceId ? (
-                                                "更新中…"
-                                            ) : (
-                                                CAST_KIND_ICON[item.kind]
-                                            )}
-                                        </div>
-                                    ) : null}
-                                    {item.locked ? (
-                                        <span className="drama-shot-flags">
-                                            <span className="drama-flag is-lock">
-                                                <Lock className="size-3" />
                                             </span>
-                                        </span>
-                                    ) : null}
-                                </div>
-                                <div className="drama-cast-card-body">
-                                    <strong>{item.name}</strong>
-                                    <span>{item.role || parseList(item.aliasesJson).join("、") || item.description || "—"}</span>
-                                </div>
-                            </button>
+                                        ) : null}
+                                    </div>
+                                    <div className="drama-cast-card-body">
+                                        <strong>{item.name}</strong>
+                                        <span>{item.role || parseList(item.aliasesJson).join("、") || item.description || "—"}</span>
+                                    </div>
+                                </button>
+                                {item.kind === "character" ? (
+                                    <div className="px-2 pb-2">
+                                        <CastVoicePreview resourceId={item.voiceSampleResourceId} name={item.name} />
+                                    </div>
+                                ) : null}
+                            </div>
                         ))}
                     </div>
                     {!list.length ? (
@@ -658,12 +668,23 @@ export function SettingsPanel({ projectId, summary, cast, onChanged }: { project
         onError: (error) => message.error(error instanceof Error ? error.message : "操作失败"),
     });
     const catalogQuery = useDramaModelCatalog();
-    const videoOption = catalogQuery.data?.options.video?.find((option) => dramaChoiceKey(option.choice) === dramaChoiceKey(settings.models.video));
+    const videoOptionFor = (choice?: DramaModelChoice) => catalogQuery.data?.options.video?.find((option) => dramaChoiceKey(option.choice) === dramaChoiceKey(choice));
+    const videoOption = videoOptionFor(settings.models.video);
     // 角色参考图用单独指定的模型，没有就用默认图片模型；参考图方案按它检查角色画幅。
     const characterImage = dramaChoiceKey(settings.models.characterImage) ? settings.models.characterImage : settings.models.image;
     const imageOption = catalogQuery.data?.options.image?.find((option) => dramaChoiceKey(option.choice) === dramaChoiceKey(characterImage));
     const videoRatioProblem = dramaVideoRatioIssue(videoOption, current.aspectRatio);
+    const videoResolutionProblem = dramaVideoResolutionIssue(videoOption, settings.videoResolution);
     const setModels = (patch: Partial<DramaSettings["models"]>) => setSettings({ ...settings, models: { ...settings.models, ...patch } });
+    const setModelChoice = (capability: DramaCapability, choice: DramaModelChoice) => {
+        if (capability !== "video") {
+            setModels({ [capability]: choice });
+            return;
+        }
+        // 视频模型与分辨率一起更新：新模型支持就保留，不支持就清空，按新模型默认档出片。
+        const next = videoOptionFor(choice);
+        setSettings({ ...settings, models: { ...settings.models, video: choice }, ...(next ? { videoResolution: dramaResolutionAfterModelChange(next, settings.videoResolution) } : {}) });
+    };
     const continuity: DramaVideoContinuity = settings.videoContinuity || "tail_frame";
     const sampleCharacter = cast.find((item) => item.kind === "character" && item.appearance);
     const sampleScene = cast.find((item) => item.kind === "scene" && item.appearance);
@@ -711,12 +732,14 @@ export function SettingsPanel({ projectId, summary, cast, onChanged }: { project
                                 />
                             </section>
                             <section className="drama-cfg-card">
-                                <SettingsTitle title="文字步骤" detail="每一步可以单独选文本模型和写作技能；不选就用默认文本模型和内置写法，对之后执行的步骤生效" icon={<ScrollText className="size-4" />} />
+                                <SettingsTitle title="文字步骤" detail="每一步可以单独设置思考意图、文本模型和写作技能；思考等级按实际使用模型的能力归一化，对之后执行的步骤生效" icon={<ScrollText className="size-4" />} />
                                 <DramaTextSteps
                                     models={settings.models}
                                     onModelsChange={setModels}
                                     skills={{ bible: settings.bibleSkill, script: settings.scriptSkill, prompt: settings.promptSkill }}
                                     onSkillChange={(step, value) => setSettings({ ...settings, [step === "bible" ? "bibleSkill" : step === "script" ? "scriptSkill" : "promptSkill"]: value })}
+                                    textThinking={settings.textThinking || {}}
+                                    onThinkingChange={(step, level) => setSettings({ ...settings, textThinking: { ...settings.textThinking, [step]: level === "auto" ? undefined : level } as DramaTextThinking })}
                                 />
                             </section>
                             <section className="drama-cfg-card">
@@ -772,9 +795,8 @@ export function SettingsPanel({ projectId, summary, cast, onChanged }: { project
                                                 capability={capability}
                                                 value={settings.models[capability]}
                                                 aspectRatio={current.aspectRatio}
-                                                videoResolution={settings.videoResolution}
                                                 placeholder={`选择${CAPABILITY_META[capability].label}模型`}
-                                                onChange={(choice) => setModels({ [capability]: choice })}
+                                                onChange={(choice) => setModelChoice(capability, choice)}
                                             />
                                         </div>
                                     ))}
@@ -787,6 +809,11 @@ export function SettingsPanel({ projectId, summary, cast, onChanged }: { project
                                     </div>
                                 </div>
                                 {videoRatioProblem ? <p className="drama-cfg-note">当前视频模型{videoRatioProblem}，剧情段视频无法提交，请换模型。</p> : null}
+                                {videoResolutionProblem ? (
+                                    <p className="drama-cfg-note">
+                                        当前视频模型{videoResolutionProblem}，实际按模型默认{videoOption?.defaultVideoResolution ? ` ${formatVideoResolutionLabel(videoOption.defaultVideoResolution)}` : ""}出片。
+                                    </p>
+                                ) : null}
                                 {videoOption?.generateAudio === false ? <p className="drama-cfg-note">当前视频模型不同步生成声音，剧情段视频没有对白与音效。</p> : null}
                             </section>
                         </div>
@@ -839,7 +866,7 @@ export function SettingsPanel({ projectId, summary, cast, onChanged }: { project
                                 {continuity !== (current.videoContinuity || "tail_frame") ? <p className="drama-cfg-note">已写好的段视频提示词按原方式撰写，切换后可在剧情段里重新撰写；已提交的视频会做完。</p> : null}
                             </section>
                             <section className="drama-cfg-card">
-                                <SettingsTitle title="同时生成数" detail="受账号并发上限约束" />
+                                <SettingsTitle title="同时生成数" detail="文字、参考图、段视频分别计算，受账号并发上限约束" />
                                 <div className="drama-tabs drama-cfg-seg" role="radiogroup" aria-label="同时生成数">
                                     {CONCURRENCY.map((value) => (
                                         <button key={value} type="button" role="radio" className="drama-tab" aria-checked={settings.concurrency === value} onClick={() => setSettings({ ...settings, concurrency: value })}>
